@@ -81,10 +81,15 @@ class FailureRecovery:
 
 
 class Store:
+    # 窗口指标账本是跨模块运行时数据，不参与“业务模块”导航和运营概览计数。
+    INTERNAL_TABLES = frozenset({"window_metric_data", "late_recompute_list"})
+
     def __init__(self) -> None:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        for name in self.INTERNAL_TABLES:
+            self._tables.setdefault(name, [])
         # 跨模块数据通道：channel_id → DataChannelEvent
         self._channels: dict[str, DataChannelEvent] = {}
         # 失败恢复记录：recovery_id → FailureRecovery
@@ -217,7 +222,7 @@ class Store:
     # ---- 基础 CRUD ----
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        return sorted(name for name in self._tables if name not in self.INTERNAL_TABLES)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])

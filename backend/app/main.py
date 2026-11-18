@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.routers import ROUTERS
+from app.services.window_metric_ledger import window_metric_ledger
 from app.store import store
 
 app = FastAPI(title="实时计算服务中心", version="2.0.0")
@@ -23,6 +24,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 演示数据：窗口指标数据 + 已发布/待补算两类清单，重复启动不会追加。
+window_metric_ledger.bootstrap_demo()
 
 
 @app.get("/api/health")

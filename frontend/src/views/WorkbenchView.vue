@@ -90,6 +90,13 @@
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <WindowMetricPanel
+      v-if="isWindowLedgerModule"
+      :key="meta.key"
+      :module-key="meta.key"
+      :mode="meta.key === 'sliding_index' ? 'metric' : 'window'"
+    />
   </section>
 </template>
 
@@ -103,10 +110,14 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import WindowMetricPanel from '@/components/WindowMetricPanel.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+// 窗口配置 / 水位追踪 / 迟到处理看受影响范围，滑动指标看重算输出与补算清单。
+const WINDOW_LEDGER_MODULES = new Set(['window_config', 'watermark_track', 'late_handler', 'sliding_index'])
+const isWindowLedgerModule = computed(() => WINDOW_LEDGER_MODULES.has(meta.key))
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')

@@ -20,6 +20,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.services.window_metric_ledger import (
+    aggregate_events,
+    classify_events,
+    window_metric_ledger,
+)
 from app.store import store
 
 
@@ -132,28 +137,8 @@ def apply_window_aggregation(
         if not window_events:
             window_start += slide_sec
             continue
-        # 分组
-        groups: dict[str, list[float]] = {}
-        for e in window_events:
-            key_parts = [str(e.get("payload", {}).get(k, "")) for k in group_keys]
-            gk = "|".join(key_parts)
-            val = e.get("payload", {}).get("amount", 0.0)
-            groups.setdefault(gk, []).append(val)
-        # 聚合
-        aggregates: dict[str, float] = {}
-        for gk, vals in groups.items():
-            for func in agg_funcs:
-                col_name = f"{gk}_{func}"
-                if func == "count":
-                    aggregates[col_name] = float(len(vals))
-                elif func == "sum":
-                    aggregates[col_name] = sum(vals)
-                elif func == "avg":
-                    aggregates[col_name] = sum(vals) / len(vals)
-                elif func == "max":
-                    aggregates[col_name] = max(vals)
-                elif func == "min":
-                    aggregates[col_name] = min(vals)
+        # 分组 + 聚合统一走窗口指标账本的共用实现
+        aggregates, _ = aggregate_events(window_events, group_keys, agg_funcs)
         results.append(WindowResult(
             window_key=f"w_{int(window_start)}_{int(window_end)}",
             start_ts=window_start,
@@ -203,23 +188,21 @@ def check_watermark_delay(
     event_buffer: list[dict[str, Any]],
     allowed_lateness_sec: float = 10.0,
 ) -> tuple[list[LateDataEntry], float]:
-    """检测水位延迟，识别迟到数据并生成旁路记录。"""
-    late_entries: list[LateDataEntry] = []
-    cutoff = current_watermark - allowed_lateness_sec
-    remaining: list[dict[str, Any]] = []
-    for e in event_buffer:
-        if e.get("event_time", 0) < cutoff:
-            late_entries.append(LateDataEntry(
-                original=copy.deepcopy(e),
-                event_time=e["event_time"],
-                expected_watermark=current_watermark,
-                bypass_reason=f"事件时间 {e['event_time']} < 水位截止 {cutoff}",
-            ))
-        else:
-            remaining.append(e)
-    # 更新水位追踪记录
-    delay_ratio = len(late_entries) / max(len(event_buffer), 1)
-    return late_entries, delay_ratio
+    """检测水位延迟，识别迟到数据并生成旁路记录。
+
+    判定口径统一来自窗口指标账本，水位追踪、迟到处理与管道不再各写一遍。
+    """
+    classified = classify_events(event_buffer, current_watermark, allowed_lateness_sec)
+    late_entries = [
+        LateDataEntry(
+            original=copy.deepcopy(e),
+            event_time=e["event_time"],
+            expected_watermark=current_watermark,
+            bypass_reason=f"事件时间 {e['event_time']} < 水位截止 {classified['cutoff']}",
+        )
+        for e in classified["late"]
+    ]
+    return late_entries, classified["late_ratio"]
 
 
 def create_backfill_from_late(
@@ -646,11 +629,38 @@ def run_end_to_end_pipeline(
         source_name, fake_watermark, events, allowed_lateness_sec=5.0,
     )
     backfill_result = create_backfill_from_late(late_entries, "window_agg_metric", source_name)
+    # 迟到事件按水位送回窗口指标数据：受影响窗口重算并登记补算清单。
+    ledger_materialized = window_metric_ledger.materialize_windows(
+        policy_name="pipeline_window_policy",
+        source_name=source_name,
+        windows=[
+            {"window_start": wr.start_ts, "window_end": wr.end_ts, "window_key": wr.window_key}
+            for wr in window_results
+        ],
+        events=events,
+        batch_id=f"pipeline_{int(min(e['event_time'] for e in events))}",
+        allowed_lateness=5.0,
+    )
+    recompute_result = window_metric_ledger.apply_late_recompute(
+        [le.original for le in late_entries],
+        source=source_name,
+        policy="pipeline_window_policy",
+        strategy="reopen_segment",
+        allowed_lateness=5.0,
+        watermark_after=fake_watermark,
+    )
     report["chain2_watermark_backfill"] = {
         "watermark": fake_watermark,
         "late_count": len(late_entries),
         "delay_ratio": delay_ratio,
         "backfill": backfill_result,
+        "metric_windows": ledger_materialized.get("window_keys", []),
+        "recompute": {
+            "ok": recompute_result.get("ok"),
+            "recomputed": recompute_result.get("recomputed", False),
+            "version_created": recompute_result.get("version_created", False),
+            "affected_windows": recompute_result.get("affected_windows", []),
+        },
     }
 
     # ---- 链路3: 双流关联→聚合→检查点 ----

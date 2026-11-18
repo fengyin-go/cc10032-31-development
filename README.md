@@ -81,3 +81,29 @@ npm run dev
 
 领域：数据工程
 子方向：数据分析与数据应用
+
+## 窗口指标数据与迟到补算清单（序号31）
+
+窗口配置链路除了生成窗口定义，还会把窗口结果物化为**窗口指标数据**
+（内部表 `window_metric_data`）；迟到事件按水位截止判定后进入**迟到补算清单**
+（内部表 `late_recompute_list`），受影响窗口重算出新版本并锁定可消费版本。
+
+- 判定与聚合统一在 `backend/app/services/window_metric_ledger.py`：
+  `classify_events` / `aggregate_events` / `WindowMetricLedger`。
+- 四个入口复用同一处理结果：窗口配置 `apply_late_events`、迟到处理
+  `handle_late_events`、水位追踪 `advance_watermark`、管道链路2。
+- 每个窗口只保留一版 `is_current`；历史版本 `publish_status=历史版本` 可追溯不可消费。
+- 补算清单记录 `watermark_before / watermark_after`、受影响窗口、锁定版本与发布状态；
+  同一迟到事件（按 event_id 或时间+载荷签名）重复到达只复用既有版本。
+- 跨多个已发布窗口时可用 `reopen_segment`（整段重开重算）或
+  `append_bypass`（只追加迟到旁路指标）。
+- 滑动指标 `recompute_from_window_metrics` 读取窗口指标数据重算指定分组。
+
+接口：`GET /api/window-metrics`、`GET /api/window-metrics/scope`、
+`GET /api/window-metrics/recompute-list`、`GET /api/window-metrics/consistency`、
+`POST /api/window-metrics/late-recompute`、
+`POST /api/window-metrics/{recompute_id}/execute`、
+`POST /api/window-metrics/group-recompute`。
+
+前端：窗口配置 / 水位追踪 / 迟到处理页展示受影响范围，
+滑动指标页展示重算输出与迟到补算清单（`frontend/src/components/WindowMetricPanel.vue`）。

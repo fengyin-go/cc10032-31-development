@@ -1,6 +1,7 @@
 """水位追踪领域服务：追踪各流式数据源的事件时间水位。
 
 增强能力: 水位趋势分析、延迟预测、溢出告警触发、水位快照持久化、对比检查
+序号31: 水位边界计算与迟到判定统一走窗口指标账本，水位变化可按受影响窗口核对。
 """
 from __future__ import annotations
 
@@ -8,6 +9,7 @@ import time
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.window_metric_ledger import classify_events, window_metric_ledger
 from app.store import store
 
 
@@ -141,10 +143,62 @@ class WatermarkTrackService(BaseModuleService):
             "state_id": state_entry["id"],
         }
 
+    def advance_watermark(
+        self,
+        watermark_name: str,
+        events: list[dict[str, Any]],
+        watermark: float,
+        *,
+        strategy: str = "reopen_segment",
+    ) -> dict[str, Any]:
+        """按迟到水位推进并更新受影响窗口（水位追踪入口）。
+
+        与窗口配置、迟到处理入口复用同一份判定和处理结果；重复推进水位不会
+        重复扩大补算范围。
+        """
+        record = None
+        for r in store.rows(self.MODULE):
+            if r.get("水位名称") == watermark_name:
+                record = r
+                break
+        if record is None:
+            return {"ok": False, "error": f"水位记录「{watermark_name}」不存在",
+                    "affected_windows": [], "version_created": False}
+        try:
+            allowed = float(record.get("延迟阈值", "10"))
+        except (ValueError, TypeError):
+            allowed = 10.0
+        source = str(record.get("数据源", ""))
+        classified = classify_events(events, watermark, allowed)
+        result = window_metric_ledger.apply_late_recompute(
+            classified["late"],
+            source=source,
+            policy=None,
+            strategy=strategy,
+            allowed_lateness=allowed,
+            watermark_after=watermark,
+        )
+        record["当前水位"] = str(watermark)
+        record["事件时间"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        if classified["late_count"]:
+            record["status"] = "延迟"
+            record["pending"] = True
+        result["late_count"] = classified["late_count"]
+        result["late_ratio"] = classified["late_ratio"]
+        result["cutoff"] = classified["cutoff"]
+        return result
+
+    def affected_scope(self, source: str | None = None) -> dict[str, Any]:
+        """窗口页面的受影响范围：按源端筛选当前指标版本和水位边界。"""
+        return window_metric_ledger.affected_scope(source=source)
+
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
         rows = store.rows(self.MODULE)
         base["normal_count"] = sum(1 for r in rows if r.get("status") == "正常")
         base["delayed_count"] = sum(1 for r in rows if r.get("status") == "延迟")
         base["overflow_count"] = sum(1 for r in rows if r.get("status") == "溢出")
+        scope = window_metric_ledger.affected_scope()
+        base["metric_windows"] = scope["total"]
+        base["pending_windows"] = len(scope["pending_windows"])
         return base

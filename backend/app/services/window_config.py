@@ -2,6 +2,8 @@
 
 数据流角色: stream_source → window_config（消费者+生产者）→ stream_job（消费者）
 增强能力: 窗口参数校验、重叠检测、策略绑定、水位推算、消费上游事件批次
+序号31: 窗口定义生成后同步物化为窗口指标数据，迟到事件按统一水位判定触发补算，
+        窗口页面据此展示受影响范围，不再只停留在窗口定义。
 """
 from __future__ import annotations
 
@@ -9,6 +11,11 @@ import time
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.window_metric_ledger import (
+    STRATEGY_REOPEN,
+    classify_events,
+    window_metric_ledger,
+)
 from app.store import store
 
 
@@ -113,6 +120,10 @@ class WindowConfigService(BaseModuleService):
             wsize, slide = 60.0, 30.0
 
         wtype = policy.get("窗口类型", "sliding")
+        try:
+            allowed_late = float(policy.get("水位延迟", "10"))
+        except (ValueError, TypeError):
+            allowed_late = 10.0
         windows = []
         if events:
             min_ts = min(e.get("event_time", time.time()) for e in events)
@@ -125,13 +136,26 @@ class WindowConfigService(BaseModuleService):
                 we = ws + wsize
                 win_events = [e for e in events if ws <= e.get("event_time", 0) < we]
                 windows.append({
+                    "window_key": f"w_{int(ws)}_{int(we)}",
                     "window_start": ws,
                     "window_end": we,
+                    "watermark_before": we - allowed_late,
+                    "watermark_after": we - allowed_late,
                     "event_count": len(win_events),
                     "policy": policy_name,
                     "source": source_name,
                 })
                 ws += step
+
+        # 3.1 同步物化窗口指标数据：窗口配置不再只产出窗口定义。
+        materialized = window_metric_ledger.materialize_windows(
+            policy_name=policy_name,
+            source_name=source_name,
+            windows=windows,
+            events=events,
+            batch_id=str(latest.get("batch_id", "")),
+            allowed_lateness=allowed_late,
+        )
 
         # 4. 写入窗口定义记录
         window_def = {
@@ -150,6 +174,7 @@ class WindowConfigService(BaseModuleService):
             "abnormal": False,
             "batch_id": latest.get("batch_id", ""),
             "window_definitions": windows,
+            "metric_batch": materialized.get("window_keys", []),
             "produced_at": time.time(),
         }
         store.rows(self.MODULE).append(window_def)
@@ -159,6 +184,8 @@ class WindowConfigService(BaseModuleService):
             "source": source_name,
             "events_consumed": len(events),
             "windows_generated": len(windows),
+            "metric_windows": materialized.get("materialized", 0),
+            "metric_duplicate": materialized.get("duplicate", False),
             "batch_id": latest.get("batch_id", ""),
         }
 
@@ -194,6 +221,67 @@ class WindowConfigService(BaseModuleService):
             "watermarks": watermarks,
         }
 
+    def apply_late_events(
+        self,
+        policy_name: str,
+        events: list[dict[str, Any]],
+        *,
+        watermark: float | None = None,
+        strategy: str = STRATEGY_REOPEN,
+    ) -> dict[str, Any]:
+        """按迟到水位更新受影响窗口（窗口配置入口）。
+
+        与迟到处理入口共用同一份判定和同一处理结果；重复到达的迟到事件复用
+        已有版本，不再次扩大补算范围。
+        """
+        policy = None
+        for r in store.rows(self.MODULE):
+            if r.get("策略名称") == policy_name:
+                policy = r
+                break
+        ledger_windows = window_metric_ledger.current_windows(policy=policy_name)
+        if policy is None and not ledger_windows:
+            return {"ok": False, "error": f"窗口策略「{policy_name}」不存在",
+                    "affected_windows": [], "version_created": False}
+        try:
+            allowed_late = float((policy or {}).get("水位延迟", "10"))
+        except (ValueError, TypeError):
+            allowed_late = 10.0
+        source = str((policy or {}).get("source") or "")
+        if not source:
+            batches = [
+                r for r in store.rows(self.MODULE)
+                if r.get("策略名称") == policy_name and r.get("source")
+            ]
+            source = str((batches[-1] if batches else {}).get("source", ""))
+        if not source:
+            current = ledger_windows or window_metric_ledger.current_windows(policy=policy_name)
+            source = str(current[0].get("source", "")) if current else ""
+        if watermark is None:
+            latest_event = max(
+                (float(event.get("event_time", 0)) for event in events), default=0.0
+            )
+            watermark = latest_event + allowed_late
+
+        classified = classify_events(events, watermark, allowed_late)
+        result = window_metric_ledger.apply_late_recompute(
+            classified["late"],
+            source=source,
+            policy=policy_name,
+            strategy=strategy,
+            allowed_lateness=allowed_late,
+            watermark_after=watermark,
+        )
+        result["late_count"] = classified["late_count"]
+        result["watermark"] = watermark
+        result["cutoff"] = classified["cutoff"]
+        result["late_distribution"] = classified["late_distribution"]
+        return result
+
+    def affected_scope(self, policy_name: str | None = None) -> dict[str, Any]:
+        """窗口页面的受影响范围：当前指标版本、水位边界和发布/待补状态。"""
+        return window_metric_ledger.affected_scope(policy=policy_name)
+
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
         rows = store.rows(self.MODULE)
@@ -201,4 +289,7 @@ class WindowConfigService(BaseModuleService):
         base["total_window_defs"] = sum(
             1 for r in rows if isinstance(r.get("window_definitions"), list)
         )
+        scope = window_metric_ledger.affected_scope()
+        base["metric_windows"] = scope["total"]
+        base["pending_recomputes"] = scope["pending_count"]
         return base
